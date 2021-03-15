@@ -1,0 +1,1825 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r, echo=FALSE, message=FALSE}
+require(utils)
+require(httr)
+require(deSolve)
+require(bbmle) # Maximum Likelihood
+require(drc)
+require(smooth)
+require(Mcomp)
+require(zoo)
+require(ggplot2)
+require(cowplot)
+require(dplyr)
+require(infotheo)
+require(psych)
+require(psychTools)
+require(xtable)
+require(purrr)
+require(magrittr)# pipe operations
+require(lubridate)# date operations
+require(tidyverse)# ggplot2, tidyr, dplyr...
+require(gridExtra)# multiple grid-based plots on a page
+#library(ggforce)# accelerating ggplot2
+require(kableExtra)# complex tables
+#library(leaflet)# map
+#install.packages("devtools")
+#devtools::install_github("RamiKrispin/coronavirus")
+require(coronavirus)
+require(latex2exp)
+require(TSA)
+require(ade4)
+require(gtsummary)
+require(texreg)
+```
+
+```{r, echo=FALSE, message=FALSE}
+jhu <- TRUE
+ecdc <- FALSE
+rki <- FALSE
+
+#### die Daten von JHU:
+# https://github.com/CSSEGISandData/COVID-19/tree/master/csse_covid_19_data/csse_covid_19_time_series
+#### können mit dem Package "coronavirus" abgerufen werden:
+if(F){ ## Dieser Teil wird nur nach update gebraucht
+  update_dataset()
+  data("coronavirus")
+  citation(package="coronavirus")
+  dim(coronavirus)
+  tail(coronavirus)
+  corona <- coronavirus
+  corona <- corona %>% 
+    group_by(country, type, date) %>%
+    summarise(total_cases = sum(cases)) %>%
+    pivot_wider(names_from = type, values_from = total_cases) %>%
+    arrange(date) %>%
+  #  mutate(active = confirmed - death - recovered) %>%
+    mutate(cumCases = cumsum(confirmed), cumDeaths = cumsum(death))
+  corona <- as.data.frame(corona)
+  
+  corona.de <- subset(coronavirus, country=="Germany")
+  corona.de <- corona.de %>% 
+    group_by(type, date) %>%
+    summarise(total_cases = sum(cases)) %>%
+    pivot_wider(names_from = type, values_from = total_cases) %>%
+    arrange(date) %>%
+  #  mutate(active = confirmed - death - recovered) %>%
+    mutate(cumCases = cumsum(confirmed),
+                  cumDeaths = cumsum(death))
+  corona.de <- as.data.frame(corona.de)
+  saveRDS(corona.de, "corona_de_20210128.rds", version=2) #
+  saveRDS(corona, "coronavirus_20210128.rds", version=2) #
+}
+corona.de <- readRDS("corona_de_20210128.rds")
+corona <- readRDS("coronavirus_20210128.rds")
+
+#################################
+#### DIE DATEN VON ECDC #########
+#################################
+
+# create the URL where the dataset is stored
+# url <- paste("https://www.ecdc.europa.eu/sites/default/files/documents/COVID-19-geographic-disbtribution-worldwide-",format(Sys.time(), "%Y-%m-%d"), ".xlsx", sep = "")
+# url <- "https://www.ecdc.europa.eu/sites/default/files/documents/COVID-19-geographic-disbtribution-worldwide-2020-08-26.xlsx"
+# download the dataset from the website to a local temporary file
+# GET(url, authenticate(":", ":", type="ntlm"), write_disk(tf <- tempfile(fileext = ".xlsx")))
+
+# Das ist die letzte Datei auf täglicher Basis:
+require(readxl)
+ecdc.daily <- read_excel("COVID-19-geographic-disbtribution-worldwide-2020-12-14.xlsx")
+detach(package:readxl)
+daily <- TRUE
+if(F){ # Neuerdings gilt dieser Code für den Download der Daten auf wöchentlicher Basis:
+  ecdc.weekly <- read.csv("https://opendata.ecdc.europa.eu/covid19/casedistribution/csv", 
+                          na.strings = "", fileEncoding = "UTF-8-BOM")
+  daily <- FALSE
+# saveRDS(ecdc.weekly, "data_2020-12-18.rds", version=2) #
+  ecdc.weekly <- readRDS("data_2020-12-18.rds")
+}
+################################################################
+####                 PREPARING   DATA                       ####
+################################################################
+ecdc.daily <- as.data.frame(ecdc.daily)
+######## REIHENFOLGE UMKEHREN UND KUMULATIVE SUMMEN BILDEN: ######
+ecdc.daily = ecdc.daily[seq(dim(ecdc.daily)[1],1),]
+if(daily){
+  ecdc.daily <-ecdc.daily %>%
+  group_by(geoId) %>%
+  mutate(cumDeaths = cumsum(deaths))
+  ecdc.daily <-ecdc.daily %>%
+  group_by(geoId) %>%
+  mutate(cumCases = cumsum(cases))
+}
+if(!daily){
+  ecdc.weekly <- ecdc.weekly %>%
+  group_by(geoId) %>%
+  mutate(cumDeaths = cumsum(deaths_weekly))
+  ecdc.weekly <- ecdc.weekly %>%
+  group_by(geoId) %>%
+  mutate(cumCases = cumsum(cases_weekly))
+}
+ecdc.daily <- as.data.frame(ecdc.daily)
+if(!daily)data$dateRep<-as.Date(strptime(data$dateRep, "%d/%m/%y"))
+
+if(ecdc & daily){
+  data_world<-aggregate(ecdc.daily$cumCases, by=list(ecdc.daily$dateRep),FUN="sum")
+  colnames(data_world) <- c("dateRep","cumCases")
+  data_world$cumDeaths<-aggregate(ecdc.daily$cumDeaths, by=list(ecdc.daily$dateRep), FUN="sum")$x
+  data_world$Size <- 7.8e9
+}
+if(jhu){
+  data_world<-aggregate(corona$cumCases, by=list(corona$date), FUN="sum")
+  colnames(data_world) <- c("dateRep", "cumCases")
+  data_world$cumDeaths<-aggregate(corona$cumDeaths, by=list(corona$date), FUN="sum")$x
+  data_world$Size <- 7.8e9
+}
+
+corona$popData2019 <- NA
+corona$popData2019[corona$country=="Germany"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="DE"][1]
+corona$popData2019[corona$country=="Italy"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="IT"][1]
+corona$popData2019[corona$country=="Switzerland"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="CH"][1]
+corona$popData2019[corona$country=="Spain"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="ES"][1]
+corona$popData2019[corona$country=="United Kingdom"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="UK"][1]
+corona$popData2019[corona$country=="France"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="FR"][1]
+corona$popData2019[corona$country=="US"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="US"][1]
+corona$popData2019[corona$country=="Brazil"] <- ecdc.daily$popData2019[ecdc.daily$geoId=="BR"][1]
+
+Sys.setlocale(category = "LC_TIME", locale="en_GB.UTF-8") # Datum auf Englisch stellen
+#Sys.setlocale(category = "LC_TIME", locale="")
+max(corona$date)
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, eval=FALSE, include=FALSE}
+if(F){     #### Überblicksplot, den man überspringen kann
+
+##################################################################
+###################     cumCases  ################################
+###################    cumDeaths   ###############################
+##################################################################
+
+#############      ALL COUNTRIES       ######################
+data <- ecdc.daily
+plot3 <- ggplot(data=subset(data, continentExp!=""), 
+       aes(x=as.Date(dateRep), y=log10(cumCases+1), colour=geoId)) + 
+       geom_line(show.legend = FALSE) +
+       ggtitle("cumCases all countries") + theme_bw()
+plot4 <- ggplot(data=data, 
+       aes(x=as.Date(dateRep), y=log10(cumDeaths+1), colour=geoId)) + 
+       geom_line(show.legend = FALSE) +
+       ggtitle("cumDeaths all countries") + theme_bw()
+ggdraw(plot_grid(plot3, plot4, ncol=2, rel_widths = c(1,1)))
+
+###############            Europe         ##################
+
+plot5 <- ggplot(data=subset(data, continentExp=="Europe"), 
+       aes(x=as.Date(dateRep), y=log10(cumCases+1), colour=geoId)) + 
+      ggtitle("cumCases Europe") +
+      geom_line(show.legend = FALSE) + theme_bw()
+plot6 <- ggplot(data=subset(data, continentExp=="Europe"), 
+       aes(x=as.Date(dateRep), y=log10(cumDeaths+1), colour=geoId)) + 
+      ggtitle("cumDeaths Europe") +
+      geom_line() + theme_bw()
+legend <-get_legend(plot6)
+plot6 <- plot6 + theme(legend.position = "none")
+### with legend:
+ggdraw(plot_grid(plot5, legend, plot6, ncol=3, rel_widths = c(1,0.5,1)))
+### without legend:
+# ggdraw(plot_grid(plot5, plot6, ncol=2, rel_widths = c(1,1)))
+
+##############             Asia           #####################
+plot7 <- ggplot(data=subset(data, continentExp=="Asia"), 
+       aes(x=as.Date(dateRep), y=log10(cumCases+1), colour=geoId)) + 
+      geom_line(show.legend = FALSE) +
+      ggtitle("cumCases Asia")
+plot8 <- ggplot(data=subset(data, continentExp=="Asia"), 
+       aes(x=as.Date(dateRep), y=log10(cumDeaths+1), colour=geoId)) + 
+  geom_line(show.legend = FALSE) +
+  ggtitle("cumDeaths Asia")
+ggdraw(plot_grid(plot7, plot8, ncol=2, rel_widths = c(1,1)))
+
+###############           America          ######################
+
+plot9 <- ggplot(data=subset(data, continentExp=="America"), 
+       aes(x=as.Date(dateRep), y=log10(cumCases+1), colour=geoId)) +
+  geom_line(show.legend = F) +
+  ggtitle("cumCases America")
+plot10 <- ggplot(data=subset(data, continentExp=="America"), 
+       aes(x=as.Date(dateRep), y=log10(cumDeaths+1), colour=geoId)) +
+  geom_line(show.legend = F) +
+  ggtitle("cumDeaths America")
+ggdraw(plot_grid(plot9, plot10, ncol=2, rel_widths = c(1,1)))
+
+#########################################################################################
+########      cumCases and cumDeaths NORMALISED for selected countries          #########
+#########################################################################################
+plot11 <- ggplot(data=subset(data, 
+          geoId %in% c("DE","US","CH","IT","UK","ES","FR","JP")),
+          aes(x=dateRep, y=(cumCases/popData2019), colour=geoId)) + 
+          geom_line(size=1) + 
+          ylab("normalised cumulative cases") + xlab("time") + theme_bw()
+plot12 <- ggplot(data=subset(data, 
+          geoId %in% c("DE","US","CH","IT","UK","ES","FR","JP")), 
+          aes(x=as.Date(dateRep), y=(cumDeaths/popData2019), colour=geoId)) + 
+          geom_line(size=1) + 
+          ylab("normalised cumulative deaths") +
+          xlab("time") +
+          theme_bw()
+ggdraw(plot_grid(plot11, plot12, ncol=2, rel_widths = c(1,1)))
+
+#########################################################################################
+########      cases and deaths NORMALISED for Switzerland                       #########
+#########################################################################################
+plot13 <- ggplot(data=subset(data, 
+#          geoId %in% c("DE","US","CH","IT","UK","ES","FR","JP")), 
+          geoId %in% c("CH"))) + 
+          geom_line(aes(x=as.Date(dateRep), y=(cases/popData2019)), size=1) + 
+          geom_line(aes(x=as.Date(dateRep), y=(20*deaths/popData2019)), size=1, colour = "red") + 
+          ylim(0,0.002) +
+          ylab("normalised cumulative deaths") +
+          xlab("time") +
+          theme_bw()
+plot13
+
+######################################################################
+############### case fatality rate = cumDeaths/cumCases ##############
+######################################################################
+
+####           Europe            #####################################
+
+ggplot(data=subset(data, continentExp=="Europe")) +
+  geom_line(aes(x=as.Date(dateRep), y=cumDeaths/cumCases, colour=geoId), size=1) +
+  ylab("(cumulative deaths) / (cumulative cases)") +
+  xlab("time") +
+  theme_bw()
+
+#########              America       #################################
+
+# Nicaragua verhält sich sehr komisch. Macht den Peak bis 0.5
+ni<-subset(data, continentExp=="America" & geoId=="NI")
+ni$cumDeaths/ni$cumCases
+
+ggplot(data=subset(data, continentExp=="America" & cumCases > 1)) +
+  geom_line(aes(x=as.Date(dateRep), y=cumDeaths/cumCases, colour=geoId), size=1) +
+  ylab("(cumulative deaths) / (cumulative cases)") +
+  xlab("time") +
+  theme_bw()
+}
+```
+
+```{r, echo=FALSE, message=FALSE}
+###############################################################################
+###############################################################################
+####### FIRST PLOT: cumCases, cumDeaths, cumDeaths/cumCases ###################
+#######         CASE FATALITY RATE            #################################
+###############################################################################
+###############################################################################
+
+################       Entire World   -- cumCases + cumDeaths   ###############
+colors <- c("cumCases" = "green", "cumDeaths" = "red")
+d<-data_world$cumDeaths[length(data_world$cumDeaths)]/data_world$Size[1]
+c<-data_world$cumCases[length(data_world$cumCases)]/data_world$Size[1]
+gg00<-ggplot(data=data_world) + 
+  geom_line(aes(x=as.Date(dateRep), y=(cumCases/Size), colour="cumCases"), show.legend = T, size=1) + 
+  geom_line(aes(x=as.Date(dateRep), y=(cumDeaths/Size), colour="cumDeaths"), show.legend = T, size=1) + 
+  geom_hline(yintercept=d) +
+  geom_hline(yintercept=c) +
+# geom_text(aes(x=as.Date("2020-08-19"), y=d, label= paste0(format(d*100, digits = 2),"%")), 
+#           nudge_y = 0.1, size=4, family = "sans", fontface = "plain") +
+#  geom_text(aes(x=as.Date("2020-08-19"), y=c, label= paste0(format(c*100, digits = 4),"%")),
+#            nudge_y = 0.1, size=4, family = "sans", fontface = "plain") +
+  annotate(geom="text", x=as.Date("2020-08-19"), y=1.5*d, label=paste0(format(d*100, digits = 2),"%")) +
+  annotate(geom="text", x=as.Date("2020-08-19"), y=1.5*c, label=paste0(format(c*100, digits = 4),"%")) +
+  scale_y_continuous(breaks = c(1e-9,1e-8,1e-7,1e-6,1e-5,1e-4,1e-3,1e-2), trans = "log10") + 
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  labs(x = "time",
+       y = "normalised cumulative counts",
+       colour = "") +
+  scale_color_manual(values = colors) +
+  theme_bw() +
+  theme(legend.position = c(0.7, 0.3)) + ggtitle("A)")
+gg00
+
+###############################################################
+######### die Enddaten / Werte für die Publikation  ###########
+###############################################################
+d<-data_world$cumDeaths[length(data_world$cumDeaths)]/data_world$Size[1]
+c<-data_world$cumCases[length(data_world$cumCases)]/data_world$Size[1]
+d # Wieviel Prozent Tote in der Welt?
+c # Wieviel Prozent Fälle weltweite?
+d/c # Letzter Stand der case-fatality-rate
+
+# Median der case-fatality-rate
+(med<-median(data_world$cumDeaths/data_world$cumCases,na.rm=T))
+mean(data_world$cumDeaths/data_world$cumCases,na.rm=T)
+###############################################################
+###############################################################
+
+######       Entire World   -- fatality-case-ratio   ##########
+
+gg01<-ggplot(data=data_world) + 
+  geom_line(aes(x=as.Date(dateRep), y=(cumDeaths/cumCases)), 
+            show.legend = FALSE, color = "red", size=1) + 
+  geom_hline(yintercept=med) +
+  geom_hline(yintercept=d/c) +
+  annotate(geom="text", x=as.Date("2020-08-19"),y=d/c+0.002, label= paste0("current ", 
+                                                format(d/c, digits = 2))) +
+  annotate(geom="text", x=as.Date("2020-06-01"), y=med+0.002, label= paste0("median ", 
+                                                format(med, digits = 2))) +
+  scale_y_continuous(breaks=c(0,0.01,0.02,0.03,0.04,0.05,0.06,0.07)) + 
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ylab("cumulative deaths (t) / cumulative cases (t)") +
+  xlab("time") +
+  theme_bw() + ggtitle("B)")
+##### Intermediate Plot
+ggdraw(plot_grid(gg00, gg01, ncol=2, rel_widths = c(1,1)))
+
+####    normalised cumCases and normalised cumDeaths for 7 selected countries    ######
+data=subset(corona,
+        country %in% c("Germany","US","Switzerland","Italy","Spain","United Kingdom","France","Brazil") & cumCases > 0 & date==max(date))
+
+deaths.max <- subset(data, (cumDeaths/popData2019)==max(cumDeaths/popData2019))$cumDeaths/
+  subset(data, (cumDeaths/popData2019)==max(cumDeaths/popData2019))$popData2019
+
+cases.max <- subset(data, (cumCases/popData2019)==max(cumCases/popData2019))$cumCases/
+  subset(data, (cumCases/popData2019)==max(cumCases/popData2019))$popData2019
+
+mdr<-subset(data, (cumDeaths/cumCases)==max(cumDeaths/cumCases))$cumDeaths/subset(data, (cumDeaths/cumCases)==max(cumDeaths/cumCases))$cumCases
+
+meandr <- mean(data$cumDeaths/data$cumCases)
+sddr <- sd(data$cumDeaths/data$cumCases)
+
+if(jhu){
+gg02 <- ggplot(data=subset(corona,
+        country %in% c("Germany","US","Switzerland","Italy","Spain","United Kingdom","France","Brazil") & cumCases > 0)) + 
+        geom_line(aes(x=as.Date(date), y=(cumCases/popData2019), 
+                linetype="cumCases"), size=1) +
+        geom_line(aes(x=as.Date(date), y=(cumDeaths/popData2019), 
+                linetype="cumDeaths"), size=1) +
+        geom_hline(yintercept=deaths.max, size=1) +
+        annotate(geom="text", x=as.Date("2020-08-19"),y=deaths.max+0.002, label= paste0("UK ", 
+                                                format(100*deaths.max, digits = 2),"%")) +
+        labs(y = "normalised cumulative cases\n normalised cumulative deaths",
+        x = "time",
+        linetype = "") + 
+        theme_bw() + ggtitle("C)")
+  legend1 <- get_legend(gg02)
+  gg02 <- ggplot(data=subset(corona,
+          country %in% c("Germany","US","Switzerland","Italy","Spain","United Kingdom","France","Brazil") & cumCases > 0)) +
+    geom_line(aes(x=as.Date(date), y=(cumCases/popData2019), 
+                  colour=country), size=1, linetype=1) +
+    geom_line(aes(x=as.Date(date), y=(cumDeaths/popData2019), 
+                  colour=country), size=1, linetype=2) +
+    geom_hline(yintercept=deaths.max) +
+    annotate(geom="text", x=as.Date("2020-11-19"),y=1.5*deaths.max, label= paste0("UK ", 
+                                                format(100*deaths.max, digits = 2),"%")) +
+    geom_hline(yintercept=cases.max) +
+    annotate(geom="text", x=as.Date("2020-11-19"),y=1.5*cases.max, label= paste0("US ", 
+                                                format(100*cases.max, digits = 2),"%")) +
+    scale_y_continuous(breaks = c(1e-9,1e-8,1e-7,1e-6,1e-5,1e-4,1e-3,1e-2), trans = "log10") + 
+    scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+    labs(y = "normalised cumulative counts", x = "time") + 
+    theme_bw() + ggtitle("C)")
+  legend <- get_legend(gg02)
+  gg02 <- gg02 + theme(legend.position="none")
+  legend_empty <- legend + geom_blank()
+  gg02
+  
+  dat=subset(corona,
+        country %in% c("Germany","US","Switzerland","Italy","Spain","United Kingdom","France","Brazil") & cumCases > 0)
+  dat$dr<-dat$cumDeaths/dat$cumCases
+  dat %>% group_by(date) %>% 
+         summarise(mdr=mean(dr))
+  gg03 <- ggplot(data=subset(corona, 
+    country %in% c("Germany","US","Switzerland","Italy","Spain","United Kingdom","France","Brazil") & cumCases > 0)) + 
+    geom_line(aes(x=as.Date(date), y=cumDeaths/cumCases, colour=country), size=1) +
+    geom_line(data = dat %>% group_by(date) %>% summarise(mdr=mean(dr)), 
+              aes(x=as.Date(date), y=mdr), size=1.2) +
+    geom_hline(yintercept = meandr) +
+    annotate(geom="text", x=as.Date("2020-07-01"),
+             y=meandr-0.005,
+             label= paste0("recent mean ",
+                           format(meandr, digits = 3),
+                           " (sd ",format(sddr, digits = 3),")"),
+             size = 2.5) +
+    annotate(geom="text", x=as.Date("2020-06-01"), 
+             y=0.09, 
+             label= paste0("mean curve"),
+             size = 3) +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+    scale_y_continuous(breaks = c(0,0.025,0.05,0.075,0.1,0.125,0.15,0.175,0.2)) + 
+    ylab("cumulative deaths (t) / cumulative cases (t)") +
+    xlab("time") +
+    theme_bw() + ggtitle("D)") +
+    theme(legend.position="none")
+  gg03
+}
+
+########             cumDeaths/cumCases for a selection of 7 countries       ############
+
+gg02a <- gg02 + annotation_custom(grob = legend1, xmax = as.Date("2021-01-01"), ymax=-3)
+gg02a
+########                      final plot for publication        #############################
+cairo_pdf("Fig01.pdf", width = 10, height = 9)
+ggdraw(plot_grid(plot_grid(gg00, legend_empty, gg01, ncol=3, rel_widths = c(1,0.3,1)), 
+                 plot_grid(gg02a, legend, gg03, ncol=3, rel_widths = c(1,0.3,1)), ncol=1))
+dev.off()
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+#######################################################################################
+#############  WERTE FÜR DIE PUBLIKATION    ###########################################
+#######################################################################################
+br <- data.frame(subset(corona, country=="Brazil"))
+l<-length(br$date)
+br$cumDeaths[l]/br$cumCases[l]
+median(br$cumDeaths/br$popData2019,na.rm=T)
+br$cumCases[l]/br$popData2019[1]
+br$cumDeath[l]/br$popData2019[1]
+
+usa <- data.frame(subset(corona, country=="US"))
+l<-length(usa$date)
+usa$cumDeaths[l]/usa$cumCases[l]
+median(usa$cumDeaths/usa$popData2019,na.rm=T)
+usa$cumCases[l]/usa$popData2019[1]
+usa$cumDeath[l]/usa$popData2019[1]
+
+de <- data.frame(subset(corona, country=="Germany"))
+l<-length(de$date)
+de$cumDeaths[l]/de$cumCases[l]
+median(de$cumDeaths/de$cumCases,na.rm=T)
+de$cumCases[l]/de$popData2019[1]
+de$cumDeath[l]/de$popData2019[1]
+
+fr <- data.frame(subset(corona, country=="France"))
+l<-length(fr$date)
+fr$cumDeaths[l]/fr$cumCases[l]
+median(fr$cumDeaths/fr$cumCases,na.rm=T)
+fr$cumCases[l]/fr$popData2019[1]
+fr$cumDeath[l]/fr$popData2019[1]
+
+
+#############################################################################################
+#############################################################################################
+##############         Plot mit Delay der kumulativen Ereignisse           ##################
+#############################################################################################
+#############################################################################################
+par(mfrow=c(3,3))
+
+#########################################################
+#######################  WORLD   ########################
+#########################################################
+
+w_dim<-dim(data_world)[1]
+w <- data_world
+w$date <- as.Date(w$date)
+#### Einschub: Boxplot soll Delay zeigen, welcher zu kleinster Variation um den Median führt
+if(FALSE){ ### kann übersprungen werden
+df <- data.frame(cC=as.double(), cD=as.double(), dr=as.double(), delay=as.integer())
+par(mfrow=c(4,4))
+for(delay in 0:15){
+  df <- rbind(df, data.frame(
+    cC = w$cumCases[1:(w_dim-delay)],
+    cD = w$cumDeaths[(delay+1):w_dim],
+    dr = w$cumDeaths[(delay+1):w_dim]/w$cumCases[1:(w_dim-delay)]-
+                     median(w$cumDeaths[(delay+1):w_dim]/w$cumCases[1:(w_dim-delay)]), 
+                     delay=delay))
+  plot(w$cumDeaths[(delay+1):w_dim],w$cumCases[1:(w_dim-delay)],type="p",pch=19)
+}
+df$delay <- as.factor(df$delay)
+levels(df$delay) <- c("delay=0","delay=1","delay=2","delay=3","delay=4",
+                      "delay=5","delay=6","delay=7","delay=8",
+                      "delay=9","delay=10","delay=11","delay=12",
+                      "delay=13","delay=14","delay=15")
+ggplot(df, aes(x=cD, y=cC)) + 
+  geom_point() +
+  ylab("cumulative cases (t)") + 
+  xlab("cumulative deaths (t-delay)") +
+  facet_wrap(~delay, ncol=4) + ggtitle("A)")
+
+head(df)
+par(mfrow=c(1,1))
+boxplot(dr ~ delay, data = df)
+
+par(mfrow=c(4,4))
+corr_all <- NULL
+for(delay in 0:15){
+m<-mean(subset(w$cumDeaths[(delay+1):w_dim]/(w$cumCases[1:(w_dim-delay)]), w$cumCases>0), na.rm = T)
+v<-var(subset(w$cumDeaths[(delay+1):w_dim]/(w$cumCases[1:(w_dim-delay)]), w$cumCases>0), na.rm = T)
+med<-median(subset(w$cumDeaths[(delay+1):w_dim]/(w$cumCases[1:(w_dim-delay)]), w$cumCases>0), na.rm = T)
+corr<-cor.test(log(w$cumDeaths[(delay+1):w_dim]+1), log(w$cumCases[1:(w_dim-delay)]+1))
+corr_est<-corr$estimate
+corr_all <- c(corr_all, corr_est)
+plot(w$dateRep[(delay+1):w_dim], w$cumDeaths[(delay+1):w_dim]/w$cumCases[1:(w_dim-delay)], 
+     type="o", ylim=c(0,0.2), xlab="time", ylab="proportion deaths", 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),"; corr=",round(corr_est,digits = 3)))
+abline(h=m)
+abline(h=med,col=2)
+}
+corr_all
+r.test(n=231, n2=231, r12=as.numeric(corr_all[1]), r34=as.numeric(corr_all[5]))
+}
+
+####################################################################
+####              DE        (PUBLIKATIONSRELEVANT)          ########
+####################################################################
+
+de$date <- as.Date(de$date)
+de_dim <- dim(de)[1]
+
+##################################################################################################
+############ Hängt maximale Korrelation von der Länge der Zeitreihe (Endzeit) ab??? ##############
+##################################################################################################
+
+tag <- NULL
+par(mfrow=c(1,1))
+for(delay in 10:16){
+for(zeit in 50:de_dim){
+  cC <- log(de$cumCases[1:(zeit-delay)]+1)
+  cD <- log(de$cumDeaths[(delay+1):zeit]+1)
+  dr = de$cumDeaths[(delay+1):zeit]/de$cumCases[1:(zeit-delay)]
+  me <- median(dr, na.rm = T)
+  corr <- cor.test(cD,cC)
+  corr_est <- as.numeric(corr$estimate)
+  tag <- rbind(tag,data.frame(as.character(round(corr_est, digits = 10)), zeit, delay) )
+}
+}
+colnames(tag)<-c("corr","time","delay")
+tag<-data.frame(tag)
+tag$delay<-as.factor(tag$delay)
+c_plot1 <- ggplot(tag) + 
+  geom_line(aes(y=as.numeric(corr), x=as.numeric(time), color=delay), size=1.2) + 
+  xlab("final observation time [days from start of epidemic]") + 
+  ylab("ln(cumDeaths)-ln(cumCases) correlation coefficient") +
+  ylim(0.98,0.995) + ggtitle("B)") + theme_bw() + 
+  theme(legend.position = c(0.8, .25))
+c_plot1
+
+###################         scatter diagram cumDeaths vs cumCases with delay     ##########
+df <- data.frame(cC=as.double(), cD=as.double(), dr=as.double(), delay=as.integer(), corr=as.double())
+tag <- NULL
+par(mfrow=c(4,4))
+for(delay in 0:15){
+  cC <- log(de$cumCases[1:(de_dim-delay)]+1)
+  cD <- log(de$cumDeaths[(delay+1):de_dim]+1)
+  dr = de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)]
+  me <- median(dr, na.rm = T)
+  corr <- cor.test(cD,cC)
+  corr_est <- as.numeric(corr$estimate)
+  len<-length(dr)
+  tag <- rbind(tag,data.frame(as.character(round(corr_est, digits = 10)), len, delay ) )
+  df <- rbind(df, data.frame(
+    cC = cC,
+    cD = cD,
+    dr = dr - me,
+    delay = delay,
+    corr = corr_est))
+  plot(cD,cC,type="p",pch=19)
+}
+#### Comparing Correlations (Steiger test)
+colnames(tag) <- c("corr","len","delay")
+tag$p <- NA
+tag
+tag_row <- max(tag$delay[tag$corr==max(tag$corr)])+1
+for(i in c(1:16)){
+test<-r.test(n=as.numeric(tag[tag_row,2]), n2=as.numeric(tag[i,2]),
+       r12=as.numeric(tag[tag_row,1]), r34=as.numeric(tag[i,1]))
+  tag$p[i] <- round(test$p,digits=3)
+}
+tag$p_adj<-round(p.adjust(tag$p, method="bon"), digits=3)
+tag<-tag[, c(3,1,4,5)]
+delay1 <- max(tag$delay[tag$corr==max(tag$corr)]) # für späteren plot benötigt
+tag$corr <- round(as.numeric(tag$corr),digits=3)
+tag
+print(xtable(tag[,c(1:4)], type = "latex", digits=3), file = "corr.tex", include.rownames = F)
+
+######################       Plot for publication     ###################################
+######################   delay=13 has best correlation  #################################
+
+df$delay <- as.factor(df$delay)
+levels(df$delay) <- c("delay=0","delay=1","delay=2","delay=3","delay=4",
+                      "delay=5","delay=6","delay=7","delay=8",
+                      "delay=9","delay=10","delay=11","delay=12",
+                      "delay=13","delay=14","delay=15")
+gg2<-ggplot(df, aes(x=cC, y=cD)) + 
+  geom_point(size=0.75) +
+  xlab("ln[cumulative cases (t-delay)]") + 
+  ylab("ln[cumulative deaths (t)]") +
+  geom_smooth(method=lm, size=0.2) + 
+  facet_wrap(~delay, ncol=4) + ggtitle("A)") + theme_bw()
+gg2
+dat_text <- data.frame(
+  label = tag[,2],
+  delay = levels(df$delay)
+)
+dat_text$delay <- as.factor(dat_text$delay)
+gg2 <- gg2 + geom_text(
+  data    = dat_text,
+  mapping = aes(x = 4, y = 8, label = label),
+)
+gg2
+
+delay <- 0
+gg3 <- ggplot(data=de[(delay+1):de_dim,]) + 
+  geom_line(aes(x=as.Date(date[(delay+1):de_dim]),
+                y=cumDeaths[(delay+1):de_dim]/cumCases[1:(de_dim-delay)]), size=1) +
+  geom_hline(yintercept=
+               median(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T), 
+               colour="red") +
+  annotate(geom="text", x=as.Date("2020-07-19"), 
+           y = median(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T)+0.003, 
+           label= paste0("median=", 
+           format(median(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T), digits = 3)),
+           colour ="red") +
+  geom_hline(yintercept=
+             mean(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T), 
+             colour="blue") +
+  annotate(geom="text", x=as.Date("2020-08-19"), 
+           y = mean(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T)-0.003, 
+           label= paste0("mean=", 
+           format(mean(de$cumDeaths[(delay+1):de_dim]/de$cumCases[1:(de_dim-delay)],na.rm=T), digits = 3)),
+           colour ="blue") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ylab("cumulative deaths (t) / cumulative cases (t)") +
+  xlab("time") +
+  ylim(0,0.12) +
+  theme_bw() + ggtitle("C)") +
+  theme(legend.position="none")
+gg3
+
+#############       output für die Publikation:   ################
+median(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T)
+mean(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T)
+
+gg3a <- ggplot(data=de[(delay1+1):de_dim,]) + 
+  geom_line(aes(x=as.Date(date[(delay1+1):de_dim]),
+                y=de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)]), size=1) +
+  geom_hline(yintercept=
+               median(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T), 
+               colour="red") +
+  annotate(geom="text", x=as.Date("2020-11-15"), 
+           y = median(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T)+0.003, 
+           label= paste0("median=", 
+           format(median(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T), digits = 3)),
+           colour ="red") +
+  geom_hline(yintercept=
+               mean(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T), 
+               colour="blue") +
+  annotate(geom="text", x=as.Date("2020-08-19"), 
+           y = mean(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T)-0.003, 
+           label= paste0("mean=", 
+           format(mean(de$cumDeaths[(delay1+1):de_dim]/de$cumCases[1:(de_dim-delay1)],na.rm=T), digits = 3)),
+           colour ="blue") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ylab(bquote("cumulative deaths (t) / cumulative cases (t -"~.(delay1)~"d)")) +
+  xlab("time") +
+  ylim(0,0.12) +
+  theme_bw() + ggtitle("D)") +
+  theme(legend.position="none")
+
+#if(ECDC==F)cairo_pdf("Fig02_rki_full.pdf", height=6, width=18)
+#if(ECDC==T)cairo_pdf("Fig02.pdf", height=10, width=10)
+if(jhu)cairo_pdf("Fig02.pdf", height=10, width=10)
+ggdraw(plot_grid(gg2,c_plot1,gg3,gg3a, ncol=2, rel_widths = c(1,1)))
+dev.off()
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+#########################################################################################
+######################################### DEATH RATE WITH DELAY #########################
+##################################### Estimation of optimal delay #######################
+#############################         Relevant für Publikation        ################### #########################################################################################
+par(mfrow=c(3,4))
+########################
+#### DE ################
+########################
+de <- data.frame(subset(corona, country=="Germany" & cumCases>0))
+es <- data.frame(subset(corona, country=="Spain" & cumCases>0))
+it <- data.frame(subset(corona, country=="Italy" & cumCases>0))
+ch <- data.frame(subset(corona, country=="Switzerland" & cumCases>0))
+ch$confirmed[ch$confirmed==0]<-NA
+us <- data.frame(subset(corona, country=="US" & cumCases>0))
+uk <- data.frame(subset(corona, country=="United Kingdom" & cumCases>0))
+br <- data.frame(subset(corona, country=="Brazil" & cumCases>0))
+fr <- data.frame(subset(corona, country=="France" & cumCases>0))
+
+#for(ii in c("de","es","it","ch","us","uk","br","fr")){
+for(ii in c("it")){
+#for(ii in c("de")){
+  if(ii=="de")country <- de
+  if(ii=="es")country <- es
+  if(ii=="it")country <- it
+  if(ii=="ch")country <- ch
+  if(ii=="us")country <- us
+  if(ii=="uk")country <- uk
+  if(ii=="br")country <- br
+  if(ii=="fr")country <- fr
+country$date <- as.Date(country$date)
+country_dim<-dim(country)[1]
+country <- country[30:country_dim,]
+country_dim<-dim(country)[1]
+
+tag <- NULL
+par(mfrow=c(1,1))
+for(delay in 10:16){
+  for(zeit in 50:country_dim){
+  c = country$confirmed[1:(zeit-delay)]
+  d = country$death[(delay+1):zeit]
+  corr<-cor.test(d, c)
+  corr_est<-as.numeric(corr$estimate)
+  tag <- rbind(tag,data.frame(as.character(round(corr_est, digits = 10)), zeit, delay) )
+  }
+}
+colnames(tag)<-c("corr","time","delay")
+tag<-data.frame(tag)
+tag$delay<-as.factor(tag$delay)
+c_plot2 <- ggplot(tag) + 
+  geom_line(aes(y=as.numeric(corr), x=as.numeric(time), color=delay), size=1.2) + 
+  xlab("final observation time [days from start of epidemic]") + 
+  ylab("deaths-cases correlation coefficient") +
+  ylim(0.5,0.9) + ggtitle("B)") + theme_bw() + 
+  theme(legend.position = c(0.4, .25))
+c_plot2
+
+df <- data.frame(c=as.double(), d=as.double(), dr=as.double(), delay=as.integer(), corr=as.double())
+tag <- NULL
+par(mfrow=c(4,4))
+for(delay in 0:15){
+  c = country$confirmed[1:(country_dim-delay)]
+  d = country$death[(delay+1):country_dim]
+  corr<-cor.test(d, c)
+  corr_est<-as.numeric(corr$estimate)
+  len<-length(d)
+  tag <- rbind(tag,data.frame(as.character(round(corr_est, digits = 3)),len,delay))
+  df <- rbind(df, data.frame(
+    c = c,
+    d = d,
+    dr = d/c - median(d/c),
+    delay=delay,
+    corr=corr_est))
+  plot(d,c,type="p",pch=19)
+}
+
+#### Comparing Correlations (Steiger test)
+colnames(tag) <- c("corr","len","delay")
+tag
+tag$p <- NA
+for(i in c(1:16)){
+test<-r.test(n=as.numeric(tag[14,2]), n2=as.numeric(tag[i,2]),
+       r12=as.numeric(tag[14,1]), r34=as.numeric(tag[i,1]))
+  tag$p[i] <- round(test$p,digits=3)
+}
+delay1 <- max(tag$delay[tag$corr==max(tag$corr)]) # wird für plot unten gebraucht
+tag$p_adj<-round(p.adjust(tag$p, method="BH"), digits=3)
+tag<-tag[, c(1,3,4,5)]
+
+print(xtable(tag[,c(2,1,3,4)], type = "latex", digits=3), file = "corr.tex", include.rownames = F)
+
+df$delay <- as.factor(df$delay)
+levels(df$delay) <- c("delay=0","delay=1","delay=2","delay=3","delay=4",
+                      "delay=5","delay=6","delay=7","delay=8",
+                      "delay=9","delay=10","delay=11","delay=12",
+                      "delay=13","delay=14","delay=15")
+gg4<-ggplot(df, aes(x=c, y=d)) + 
+  geom_point() +
+  geom_smooth(method=lm) + 
+  scale_x_continuous(breaks = c(0,10000,20000,30000,40000,50000)) + 
+  xlab("cases (t-delay)") + 
+  ylab("deaths (t)") +
+  facet_wrap(~delay, ncol=4) + ggtitle("A)") + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = 0.5))
+
+dat_text <- data.frame(
+  label = tag[,1],
+  delay = levels(df$delay)
+)
+dat_text$delay <- as.factor(dat_text$delay)
+gg4 <- gg4 + geom_text(
+  data    = dat_text,
+  mapping = aes(x = 35000, y = 1500, label = label),
+#  hjust   = -3,
+#  vjust   = -3
+)
+gg4
+
+delay2 <- 0
+gg3 <- ggplot(data=country[(delay2+1):country_dim,]) + 
+  geom_line(aes(x=as.Date(date[(delay2+1):country_dim]),
+                y=death[(delay2+1):country_dim]/confirmed[1:(country_dim-delay2)]), size=1) +
+  geom_hline(yintercept=
+             median(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)],na.rm=T), 
+             colour="red") +
+  geom_hline(yintercept=
+             mean(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)],na.rm=T), 
+             colour="blue") +
+  annotate(geom="text", x=as.Date("2020-09-19"), 
+           y = median(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)],na.rm=T)+0.008, 
+           label= paste0("median=", 
+           format(median(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)], na.rm=T), 
+                  digits = 3)),
+           colour ="red") +
+  annotate(geom="text", x=as.Date("2020-08-19"), 
+           y = mean(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)],na.rm=T)+0.008, 
+           label= paste0("mean=", 
+           format(mean(country$death[(delay2+1):country_dim]/country$confirmed[1:(country_dim-delay2)],na.rm=T), 
+                  digits = 3)),
+           colour ="blue") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+#  scale_y_continuous(oob=scales::discard, limits = c(0,0.4)) +
+  ylab("deaths (t) / cases (t)") +
+  xlab("time") +
+  ylim(0,0.4) +
+  theme_bw() + ggtitle("C)") +
+  theme(legend.position="none")
+gg3
+
+ss<-subset(country$death[(delay1+1):country_dim]/country$confirmed[1:(country_dim-delay1)], !is.infinite(country$death[(delay1+1):country_dim]/country$confirmed[1:(country_dim-delay1)]))
+m<-mean(ss,na.rm=T)
+m
+hist(country$death)
+me<-median(ss,na.rm=T)
+me
+
+gg3a <- ggplot(data=country[(delay1+1):country_dim,]) + 
+  geom_line(aes(x=as.Date(date[(delay1+1):country_dim]),
+                y=death[(delay1+1):country_dim]/confirmed[1:(country_dim-delay1)]), size=1) +
+  geom_hline(yintercept=me, 
+           colour="red") +
+  annotate(geom="text", x=as.Date("2020-09-19"), 
+           y = me+0.008, # für fig 3
+#           y = 0.35, # für fig 5
+           label= paste0("median=", 
+           format(me, digits = 4)),
+           colour ="red") + # für fig 3
+#           colour ="red", size=10) + # für fig 5
+#### von hier ab auskommentieren für die Länderübersicht
+  geom_hline(yintercept=m, 
+           colour="blue") +
+  annotate(geom="text", x=as.Date("2020-08-19"), 
+           y = m+0.008, 
+           label= paste0("mean=", 
+           format(m, digits = 3)),
+           colour ="blue") +
+#### bis hier auskommentieren für die Länderübersicht
+  ylab(bquote("deaths (t) / cases (t -"~.(delay1)~"d)")) +
+  xlab("time") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_y_continuous(breaks = c(0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4), limits = c(0,0.4)) +
+  theme_bw() + 
+  ggtitle(paste("D)")) + # für fig 3
+#  ggtitle(paste("country=",ii)) + # für fig 5
+  theme(legend.position="none")
+gg3a
+ggsave(gg3a,filename=paste("dr_",ii,".pdf",sep=""), device="pdf")
+}
+
+if(jhu)cairo_pdf("Fig03.pdf", height=12, width=12)
+ggdraw(plot_grid(gg4,c_plot2,gg3,gg3a,ncol=2, rel_widths = c(1,1)))
+dev.off()
+
+
+ggplot(data=country[(delay1+1):country_dim,]) + 
+  geom_line(aes(x=confirmed[1:(country_dim-delay1)],
+                y=death[(delay1+1):country_dim]/confirmed[1:(country_dim-delay1)]), size=1) +
+  ylab(bquote("deaths (t) / cases (t -"~.(delay1)~"d)")) +
+  xlab("time") +
+  theme_bw() + 
+  ggtitle(paste("D)")) + # für fig 3
+#  ggtitle(paste("country=",ii)) + # für fig 5
+  theme(legend.position="none")
+
+
+
+ts<-cbind(
+  country$death[(delay1+1):country_dim]/country$confirmed[1:(country_dim-delay1)], 
+  0.001*country$confirmed[1:(country_dim-delay1)],
+  (1/30)*(1:(country_dim-delay1)))
+
+summary(lm_it<-lm(ts[20:(country_dim-delay1),1]~ts[20:(country_dim-delay1),2] * ts[20:(country_dim-delay1),3]))
+summary(lm(ts[,1]~ts[,3]))
+texreg(list(lm_it,lm_de), digits = 3)
+
+with(data = country[(delay1+1):country_dim,],
+cor.test(death[(delay1+1):country_dim]/confirmed[1:(country_dim-delay1)],
+     confirmed[1:(country_dim-delay1)]))
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+##################################################################################################
+
+##################################################################################################
+delay_mini <- 0
+delay_maxi <- 17
+par(mfrow=c(3,4))
+if(TRUE){
+de <- data.frame(subset(corona, country=="Germany" & as.Date(date) > as.Date("2020-02-29")))
+de_dim<-dim(de)[1]
+death_rate <- data.frame()
+death_rate_mean <- data.frame()
+# mit einem Delay von 10-14 Tagen kriegt mab einen plausiblen (halbwegs konstanten) Plot
+# optimal delay estimated based on correlation or mutual information
+# loop over some plausible delays
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+  m<-mean(subset(de$death[(delay+1):de_dim]/(de$confirmed[1:(de_dim-delay)]), de$confirmed>0), na.rm = T)
+  v<-var(subset(de$death[(delay+1):de_dim]/(de$confirmed[1:(de_dim-delay)]), de$confirmed>0), na.rm = T)
+  med<-median(subset(de$death[(delay+1):de_dim]/(de$confirmed[1:(de_dim-delay)]), de$confirmed>0), na.rm = T)
+  corr<-cor.test(de$death[(delay+1):de_dim], de$confirmed[1:(de_dim-delay)])
+  corr_est<-corr$estimate
+  mutentropy <- mutinformation(de$death[(delay+1):de_dim], de$confirmed[1:(de_dim-delay)]) / 
+    sqrt(entropy(de$death[(delay+1):de_dim]) * entropy(de$confirmed[1:(de_dim-delay)]))
+  
+  delay_max <- "#000000"
+  if(delay==13)delay_max <- "#111111"
+  death_rate_meta <- data.frame(m=m, med=med, v=v, delay=delay, state="DE",
+                                   delay_max=delay_max, mutentropy=mutentropy, corr=corr_est)
+  death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+  death_rate_meta <- data.frame(dr=subset(de$death[(delay+1):de_dim]/de$confirmed[1:(de_dim-delay)], de$confirmed>0), 
+                                delay=delay, date_cal=subset(de$date[(delay+1):de_dim], de$confirmed>0), state="DE")
+  death_rate <- rbind(death_rate, death_rate_meta)
+  plot(subset(de$date[(delay+1):de_dim], de$confirmed>0), 
+       subset(de$death[(delay+1):de_dim]/de$confirmed[1:(de_dim-delay)], de$confirmed>0), 
+       type="o", ylim=c(0,0.2), 
+       main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                  round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+       xlab="time", ylab="proportion deaths")
+  abline(h=m)
+  abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m), colour="blue") + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med), colour="green") + 
+  facet_wrap(~ delay, ncol=4) + theme_bw() 
+
+########################
+#### USA ###############
+########################
+usa <- data.frame(subset(corona, country=="US" & cumCases>0))
+usa_dim<-dim(usa)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(usa$death[(delay+1):usa_dim]/(usa$confirmed[1:(usa_dim-delay)]), usa$confirmed>0), na.rm = T)
+v<-var(subset(usa$death[(delay+1):usa_dim]/(usa$confirmed[1:(usa_dim-delay)]), usa$confirmed>0), na.rm = T)
+med<-median(subset(usa$death[(delay+1):usa_dim]/(usa$confirmed[1:(usa_dim-delay)]), usa$confirmed>0), na.rm = T)
+corr<-cor.test(usa$death[(delay+1):usa_dim], usa$confirmed[1:(usa_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(usa$death[(delay+1):usa_dim], usa$confirmed[1:(usa_dim-delay)]) / 
+  sqrt(entropy(usa$death[(delay+1):usa_dim]) * entropy(usa$confirmed[1:(usa_dim-delay)]))
+delay_max <- "#000000"
+if(delay==5)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="US",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(usa$death[(delay+1):usa_dim]/usa$confirmed[1:(usa_dim-delay)],
+                                        usa$confirmed>0), delay=delay, date_cal=subset(usa$date[(delay+1):usa_dim], usa$confirmed>0), state="US")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(usa$date[(delay+1):usa_dim], usa$confirmed>0), 
+     subset(usa$death[(delay+1):usa_dim]/usa$confirmed[1:(usa_dim-delay)], usa$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+########################
+#### IT ################
+########################
+it <- data.frame(subset(corona, country=="Italy" & cumCases>0))
+it_dim<-dim(it)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(it$death[(delay+1):it_dim]/(it$confirmed[1:(it_dim-delay)]), it$confirmed>0), na.rm = T)
+v<-var(subset(it$death[(delay+1):it_dim]/(it$confirmed[1:(it_dim-delay)]), it$confirmed>0), na.rm = T)
+med<-median(subset(it$death[(delay+1):it_dim]/(it$confirmed[1:(it_dim-delay)]), it$confirmed>0), na.rm = T)
+corr<-cor.test(it$death[(delay+1):it_dim], it$confirmed[1:(it_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(it$death[(delay+1):it_dim], it$confirmed[1:(it_dim-delay)]) / 
+  sqrt(entropy(it$death[(delay+1):it_dim]) * entropy(it$confirmed[1:(it_dim-delay)]))
+delay_max <- "#000000"
+if(delay==5)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="IT",
+                                 delay_max=delay_max, mutentropy=mutentropy, corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(it$death[(delay+1):it_dim]/it$confirmed[1:(it_dim-delay)],it$confirmed>0), delay=delay, date_cal=subset(it$date[(delay+1):it_dim], it$confirmed>0), state="IT")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(it$date[(delay+1):it_dim], it$confirmed>0), 
+     subset(it$death[(delay+1):it_dim]/it$confirmed[1:(it_dim-delay)],it$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+########################
+#### CH ################
+########################
+ch <- data.frame(subset(corona, country=="Switzerland" & cumCases>0))
+ch_dim<-dim(ch)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(ch$death[(delay+1):ch_dim]/(ch$confirmed[1:(ch_dim-delay)]), ch$confirmed>0), na.rm = T)
+v<-var(subset(ch$death[(delay+1):ch_dim]/(ch$confirmed[1:(ch_dim-delay)]), ch$confirmed>0), na.rm = T)
+med<-median(subset(ch$death[(delay+1):ch_dim]/(ch$confirmed[1:(ch_dim-delay)]), ch$confirmed>0), na.rm = T)
+corr<-cor.test(ch$death[(delay+1):ch_dim], ch$confirmed[1:(ch_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(ch$death[(delay+1):ch_dim], ch$confirmed[1:(ch_dim-delay)]) / 
+  sqrt(entropy(ch$death[(delay+1):ch_dim]) * entropy(ch$confirmed[1:(ch_dim-delay)]))
+delay_max <- "#000000"
+if(delay==12)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="CH",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(ch$death[(delay+1):ch_dim]/ch$confirmed[1:(ch_dim-delay)],ch$confirmed>0), delay=delay, date_cal=subset(ch$date[(delay+1):ch_dim], ch$confirmed>0), state="CH")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(ch$date[(delay+1):ch_dim], ch$confirmed>0), 
+     subset(ch$death[(delay+1):ch_dim]/ch$confirmed[1:(ch_dim-delay)],ch$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+########################
+#### UK ################
+########################
+uk <- data.frame(subset(corona, country=="United Kingdom" & cumCases>0))
+uk_dim<-dim(uk)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(uk$death[(delay+1):uk_dim]/(uk$confirmed[1:(uk_dim-delay)]), uk$confirmed>0), na.rm = T)
+v<-var(subset(uk$death[(delay+1):uk_dim]/(uk$confirmed[1:(uk_dim-delay)]), uk$confirmed>0), na.rm = T)
+med<-median(subset(uk$death[(delay+1):uk_dim]/(uk$confirmed[1:(uk_dim-delay)]), uk$confirmed>0), na.rm = T)
+corr<-cor.test(uk$death[(delay+1):uk_dim], uk$confirmed[1:(uk_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(uk$death[(delay+1):uk_dim], uk$confirmed[1:(uk_dim-delay)]) / 
+  sqrt(entropy(uk$death[(delay+1):uk_dim]) * entropy(uk$confirmed[1:(uk_dim-delay)]))
+delay_max <- "#000000"
+if(delay==5)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="UK",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(uk$death[(delay+1):uk_dim]/uk$confirmed[1:(uk_dim-delay)],uk$confirmed>0), delay=delay, date_cal=subset(uk$date[(delay+1):uk_dim], uk$confirmed>0), state="UK")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(uk$date[(delay+1):uk_dim], uk$confirmed>0), 
+     subset(uk$death[(delay+1):uk_dim]/uk$confirmed[1:(uk_dim-delay)],uk$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+########################
+#### FR ################
+########################
+fr <- data.frame(subset(corona, country=="France" & cumCases>0))
+fr_dim<-dim(fr)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(fr$death[(delay+1):fr_dim]/(fr$confirmed[1:(fr_dim-delay)]), fr$confirmed>0), na.rm = T)
+v<-var(subset(fr$death[(delay+1):fr_dim]/(fr$confirmed[1:(fr_dim-delay)]), fr$confirmed>0), na.rm = T)
+med<-median(subset(fr$death[(delay+1):fr_dim]/(fr$confirmed[1:(fr_dim-delay)]), fr$confirmed>0), na.rm = T)
+corr<-cor.test(fr$death[(delay+1):fr_dim], fr$confirmed[1:(fr_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(fr$death[(delay+1):fr_dim], fr$confirmed[1:(fr_dim-delay)]) / 
+  sqrt(entropy(fr$death[(delay+1):fr_dim]) * entropy(fr$confirmed[1:(fr_dim-delay)]))
+delay_max <- "#000000"
+if(delay==6)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="FR",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(fr$death[(delay+1):fr_dim]/fr$confirmed[1:(fr_dim-delay)],fr$confirmed>0), delay=delay, date_cal=subset(fr$date[(delay+1):fr_dim], fr$confirmed>0), state="FR")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(fr$date[(delay+1):fr_dim], fr$confirmed>0), 
+     subset(fr$death[(delay+1):fr_dim]/fr$confirmed[1:(fr_dim-delay)],fr$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+########################
+#### ES ################
+########################
+es <- data.frame(subset(corona, country=="Spain" & cumCases>0))
+es_dim<-dim(es)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(es$death[(delay+1):es_dim]/(es$confirmed[1:(es_dim-delay)]), es$confirmed>0), na.rm = T)
+v<-var(subset(es$death[(delay+1):es_dim]/(es$confirmed[1:(es_dim-delay)]), es$confirmed>0), na.rm = T)
+med<-median(subset(es$death[(delay+1):es_dim]/(es$confirmed[1:(es_dim-delay)]), es$confirmed>0), na.rm = T)
+corr<-cor.test(es$death[(delay+1):es_dim], es$confirmed[1:(es_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(es$death[(delay+1):es_dim], es$confirmed[1:(es_dim-delay)]) / 
+  sqrt(entropy(es$death[(delay+1):es_dim]) * entropy(es$confirmed[1:(es_dim-delay)]))
+delay_max <- "#000000"
+if(delay==7)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="ES",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(es$death[(delay+1):es_dim]/es$confirmed[1:(es_dim-delay)],es$confirmed>0), delay=delay, date_cal=subset(es$date[(delay+1):es_dim], es$confirmed>0), state="ES")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(es$date[(delay+1):es_dim], es$confirmed>0), 
+     subset(es$death[(delay+1):es_dim]/es$confirmed[1:(es_dim-delay)],es$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+########################
+#### BR ################
+########################
+br <- data.frame(subset(corona, country=="Brazil" & cumCases>0))
+br_dim<-dim(br)[1]
+#for(delay in c(5,6,7,8,9,10,11,12,13,14,15,16)){
+for(delay in delay_mini:delay_maxi){
+m<-mean(subset(br$death[(delay+1):br_dim]/(br$confirmed[1:(br_dim-delay)]), br$confirmed>0), na.rm = T)
+v<-var(subset(br$death[(delay+1):br_dim]/(br$confirmed[1:(br_dim-delay)]), br$confirmed>0), na.rm = T)
+med<-median(subset(br$death[(delay+1):br_dim]/(br$confirmed[1:(br_dim-delay)]), br$confirmed>0), na.rm = T)
+corr<-cor.test(br$death[(delay+1):br_dim], br$confirmed[1:(br_dim-delay)])
+corr_est<-corr$estimate
+mutentropy <- mutinformation(br$death[(delay+1):br_dim], br$confirmed[1:(br_dim-delay)]) / 
+  sqrt(entropy(br$death[(delay+1):br_dim]) * entropy(br$confirmed[1:(br_dim-delay)]))
+delay_max <- "#000000"
+if(delay==7)delay_max <- "#111111"
+death_rate_meta <- data.frame(m=m,med=med,v=v,delay=delay,state="BR",
+                                 delay_max=delay_max,mutentropy=mutentropy,corr=corr_est)
+death_rate_mean <- rbind(death_rate_mean, death_rate_meta)
+death_rate_meta <- data.frame(dr=subset(br$death[(delay+1):br_dim]/br$confirmed[1:(br_dim-delay)],br$confirmed>0), delay=delay, date_cal=subset(br$date[(delay+1):br_dim], br$confirmed>0), state="BR")
+death_rate <- rbind(death_rate, death_rate_meta)
+plot(subset(br$date[(delay+1):br_dim], br$confirmed>0), 
+     subset(br$death[(delay+1):br_dim]/br$confirmed[1:(br_dim-delay)],br$confirmed>0), 
+     type="o", ylim=c(0,0.2), 
+     main=paste("delay=",delay,"; var=",round(v,digits=3),";\ncorr=",
+                round(corr_est,digits = 3),"; me=",round(mutentropy,digits=3)), 
+     xlab="time", ylab="proportion deaths")
+abline(h=m)
+abline(h=med,col=2)
+}
+ggplot(subset(death_rate, !is.na(dr))) + 
+  geom_line(aes(x=date_cal, y=dr, color=state)) + ylim(0,0.2) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=m, colour=state)) + 
+  geom_hline(data=death_rate_mean, aes(yintercept=med, colour=state)) + 
+  facet_wrap(~ delay, ncol=4) + theme_bw()
+
+ggplot(subset(death_rate, !is.na(dr) & delay > 9)) +
+  geom_line(aes(x=date_cal, y=dr)) + ylim(0,0.2) +  xlab("time") + ylab("deaths / cases") +
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=m), colour="blue") + 
+  geom_hline(data=subset(death_rate_mean, delay > 9), 
+             aes(yintercept=med), colour="red") + 
+  facet_grid(delay ~ state) + theme_bw()
+
+}
+
+###################################################################################################
+######################               PLOT (so eine Art heatmap)       #############################
+###################### ZEIGT DIE OBEN ERMITTELTE DEATH RATE WITH DELAY ############################
+###################################################################################################
+gg5 <- ggplot(subset(death_rate, !is.na(dr) &  
+                       delay > (delay_mini-1) & delay < (delay_maxi+1))) +
+  geom_line(aes(x=date_cal, y=dr), size=0.1) + ylim(0,0.2) +  xlab("time") + 
+  scale_x_date(date_breaks = "3 month", date_labels = "%m-%y") +
+  ylab("deaths(t) / cases(t-delay)") +
+  geom_hline(data=subset(death_rate_mean, delay > (delay_mini-1) & 
+                           delay < (delay_maxi+1) ), 
+             aes(yintercept=m), colour="blue", size=1) + 
+  geom_hline(data=subset(death_rate_mean, delay > (delay_mini-1) & 
+                           delay < (delay_maxi+1) ), 
+             aes(yintercept=med), colour="green", size=1) + theme_bw() + 
+  geom_rect(data=subset(death_rate_mean, delay > (delay_mini-1) & 
+                          delay < (delay_maxi+1) ), 
+            aes(fill = corr), alpha=0.6, xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf, show.legend = T) + 
+  scale_fill_gradient2(low = "#0000FF", mid = "#FFFFFF", high = "#FF0000",  midpoint = 0.5, 
+                     aesthetics = "fill", limits = c(NA,NA)) +
+  facet_grid(delay ~ state) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) 
+# scale_fill_manual(values = alpha(c("black", "black"), c(.05,.25))) + 
+#  theme(panel.background = element_rect(fill = "lightgray",
+#                                colour = "black",
+#                                size = 0.2, linetype = "solid"))
+if(jhu)cairo_pdf("Fig04.pdf", height=14.5, width=12)
+  gg5
+dev.off()
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+######################################################################################################
+############################            R_0 schätzen            ######################################
+######################################################################################################
+
+require(plot3D)
+################################################################
+###############     DEUTSCHLAND       ##########################
+################################################################
+de <- data.frame(subset(corona, country=="Germany" & cumCases>0))
+l<-length(de$confirmed)
+########    DELAY - AUTOKORRELATION UND SO EINE ART EMBEDDING    #########
+corr_est_c <- NULL
+corr_est_d <- NULL
+par(mfrow=c(4,5), mar = c(0, 0, 0, 0) + 0.1)
+for(i in 0:16){
+#for(i in c(7,9,11,13)){
+#scatter3D(de$confirmed[(2*i+1):l], de$confirmed[(i+1):(l-i)], de$confirmed[1:(l-2*i)], 
+#          phi=30, pch=19, col=1, type="l")
+#scatter2D(de$confirmed[(2*i+1):l], de$confirmed[(i+1):(l-i)], pch=19, col=1, type="o")
+#scatter2D(de$confirmed[(i+1):(l-i)], de$confirmed[1:(l-2*i)], pch=19, col=1, type="o")
+#scatter2D(de$confirmed[(2*i+1):l], de$confirmed[1:(l-2*i)], pch=19, col=1, type="o")
+scatter2D(log10(de$confirmed[(i+1):l]), log10(de$confirmed[1:(l-i)]), pch=19, col=1, type="o")
+#cor <- cor.test(de$confirmed[(i+1):l], de$confirmed[1:(l-i)] )
+cor <- cor.test(de$death[(i+1):l], de$death[1:(l-i)] )
+corr_est_d <- c(corr_est_d, cor$estimate)
+cor <- cor.test(de$confirmed[(i+1):l], de$confirmed[1:(l-i)] )
+corr_est_c <- c(corr_est_c, cor$estimate)
+}
+
+####      Die Autokorrelation nimmt monoton mit dem delay ab, 
+####           macht aber bei 6d und 12d ein Plateau
+
+if(jhu)cairo_pdf("Fig05.pdf", width = 12, height = 6)
+{
+layout(matrix(c(1,1,1,2,3,4,1,1,1,5,6,7,1,1,1,8,9,10), 3, 6, byrow = T), heights=c(1,1,1))
+#par(mfrow=c(1,1), mar = c(5, 4, 4, 2) + 0.1)
+par(mar = c(4, 4, 0, 2) + 0.1)
+plot(0:16, corr_est_d, type="o", pch=19, xaxt="n", yaxt="n", ylim=c(0.4,1), col=2, ylab="", xlab="")
+mtext(expression(paste("Delay ", Delta, t, " [days]")), side=1,line=2.2,cex=0.8)
+mtext(expression(paste("C(",Delta,t,")")), side=2,line=2,cex=0.8)
+lines(0:16,corr_est_c, type="o", pch=19, xaxt="n", yaxt="n", ylim=c(0.4,1), col=4)
+axis(1, at = 0:16)
+axis(2, at = seq(from=0, to=1, by=0.05))
+abline(v=c(0:16), lty=2, col="gray")
+abline(h=seq(from=0, to=1, by=0.05), lty=2, col="gray")
+legend(11.5,0.95,legend=c("cases","deaths"), lty = 1, col = c(4,2), pch=19)
+
+####    ich schließe, dass die Inkubationszeit ca 6 Tage beträgt
+
+##########################   I(t+1) / I(t)  #################################################
+par(mar = c(5.5, 2, 0.5, .1) + 0.1)
+for(i in 1:9){
+plot(as.Date(de$date[(i+1):l]),de$confirmed[(i+1):l]/de$confirmed[1:(l-i)], col=1, type="l", 
+     ylim=c(0,5), ylab="", xlab="", cex.axis =1, xaxt="n")
+axis.Date(1, at=seq(as.Date("2020-02-01"), as.Date("2021-02-01"), by="1 mon"), format="%d/%m/%y", las = 2)
+G=seq(from=7+i,to=l,by=7)
+lines(as.Date(de$date[G]),rollapply(de$confirmed[(i+1):l]/de$confirmed[1:(l-i)],7,FUN=mean,by=7),col=2)
+if(i==1 || i==4 || i==7){
+  mtext(side=2,"reproduction ratio",line=2,cex=0.8)
+} else {
+  mtext(side=2,"",line=2,cex=0.8)
+}
+#if(i==7 || i==8 || i==9){
+  mtext(side=1,"time",line=4.5,cex=0.8)
+#} else {
+  mtext(side=1,"", line=1, cex=0.8)
+#}
+mtext(paste("delay =", as.character(i)), side=3, cex=0.8, line = -1.2)
+#plot(de$death[(i+1):l]/de$death[1:(l-i)], col=1, type="l", ylim=c(0,5))
+abline(h=1)
+}
+}
+dev.off()
+
+
+
+################################################################
+###############     FRANKREICH      ############################
+################################################################
+
+fr <- data.frame(subset(corona, country=="France" & cumCases>0))
+l<-length(fr$confirmed)
+########    DELAY - AUTOKORRELATION UND SO EINE ART EMBEDDING    #########
+corr_est_c <- NULL
+corr_est_d <- NULL
+par(mfrow=c(4,5), mar = c(0, 0, 0, 0) + 0.1)
+for(i in 0:16){
+#for(i in c(7,9,11,13)){
+#scatter3D(fr$confirmed[(2*i+1):l], fr$confirmed[(i+1):(l-i)], fr$confirmed[1:(l-2*i)], 
+#          phi=30, pch=19, col=1, type="l")
+#scatter2D(fr$confirmed[(2*i+1):l], fr$confirmed[(i+1):(l-i)], pch=19, col=1, type="o")
+#scatter2D(fr$confirmed[(i+1):(l-i)], fr$confirmed[1:(l-2*i)], pch=19, col=1, type="o")
+#scatter2D(fr$confirmed[(2*i+1):l], fr$confirmed[1:(l-2*i)], pch=19, col=1, type="o")
+scatter2D(log10(fr$confirmed[(i+1):l]), log10(fr$confirmed[1:(l-i)]), pch=19, col=1, type="o")
+#cor <- cor.test(fr$confirmed[(i+1):l], fr$confirmed[1:(l-i)] )
+cor <- cor.test(fr$death[(i+1):l], fr$death[1:(l-i)] )
+corr_est_d <- c(corr_est_d, cor$estimate)
+cor <- cor.test(fr$confirmed[(i+1):l], fr$confirmed[1:(l-i)] )
+corr_est_c <- c(corr_est_c, cor$estimate)
+}
+
+####      Die Autokorrelation nimmt monoton mit dem delay ab, 
+####           macht aber bei 6d und 12d ein Plateau
+
+cairo_pdf("Fig06.pdf", width = 12, height = 6)
+{
+layout(matrix(c(1,1,1,2,3,4,1,1,1,5,6,7,1,1,1,8,9,10), 3, 6, byrow = T), heights=c(1,1,1))
+#par(mfrow=c(1,1), mar = c(5, 4, 4, 2) + 0.1)
+par(mar = c(3, 4, 0, 2) + 0.1)
+plot(0:16,corr_est_d, type="o", pch=19, xaxt="n", yaxt="n", ylim=c(0.3,1), col=2, ylab="")
+mtext(expression(paste("Delay ",Delta,t," [days]")), side=1,line=2.2,cex=0.8)
+mtext(expression(paste("C(",Delta,t,")")), side=2,line=2,cex=0.8)
+lines(0:16,corr_est_c, type="o", pch=19, xaxt="n", yaxt="n", ylim=c(0.4,1), col=4)
+axis(1, at = 0:16)
+axis(2, at = seq(from=0, to=1, by=0.05))
+abline(v=c(0:16), lty=2, col="gray")
+abline(h=seq(from=0, to=1, by=0.05), lty=2, col="gray")
+legend(11.5,0.95,legend=c("cases","deaths"), lty = 1, col = c(4,2), pch=19)
+
+####    ich schließe, dass die Inkubationszeit ca 6 Tage beträgt
+
+##########################   I(t+1) / I(t)  #################################################
+par(mar = c(5.5, 2, 0.5, .1) + 0.1)
+for(i in 1:9){
+plot(as.Date(fr$date[(i+1):l]),fr$confirmed[(i+1):l]/fr$confirmed[1:(l-i)], col=1, type="l", ylim=c(0,6),ylab="",xlab="",cex.axis =1, xaxt="n")
+axis.Date(1, at=seq(as.Date("2020-02-01"), as.Date("2021-02-01"), by="1 mon"), format="%d/%m/%y", las = 2)
+G=seq(from=7+i,to=l,by=7)
+lines(as.Date(fr$date[G]),rollapply(fr$confirmed[(i+1):l]/fr$confirmed[1:(l-i)],7,FUN=mean,by=7),col=2)
+if(i==1 || i==4 || i==7){
+  mtext(side=2,"reproduction ratio",line=2,cex=0.8)
+} else {
+  mtext(side=2,"",line=2,cex=0.8)
+}
+#if(i==7 || i==8 || i==9){
+  mtext(side=1,"time",line=4.5,cex=0.8)
+#} else {
+  mtext(side=1,"", line=1, cex=0.8)
+#}
+mtext(paste("                    delay =", ## blanks stehen lassen, um den Text nach rechts zu schieben
+            as.character(i)), side=3, cex=0.8, line = -1.2)
+abline(h=1)
+}
+}
+dev.off()
+
+```
+
+```{r, echo=FALSE, message=FALSE}
+####################################################################################
+############       cumI(t+1) = cumI(t) exp(lambda)    ###############################
+############  =>  lambda = ln(1 + I(t+1)/cumI(t) )     ##############################
+####################################################################################
+
+de <- data.frame(subset(corona, country=="Germany" & cumCases>0))
+l<-length(de$confirmed)
+par(mfrow=c(3,3), mar = c(5, 4, 4, 2) + 0.1)
+meta<-data.frame(time = as.double(), lambda = as.double(), delay = as.integer())
+for(i in 1:9){
+  meta <- rbind(meta, data.frame(time = de$date[(i+1):l], 
+                lambda = (log(de$cumCases[(i+1):l]) - log(de$cumCases[1:(l-i)]))/i,
+                delay = i))
+#  plot(de$dateRep[(i+1):l], (log(de$cumCases[(i+1):l]) - log(de$cumCases[1:(l-i)])) / i, 
+#      col=3, lwd=2, type="l", ylim=c(0,0.8))
+#  abline(h=log(2))
+#  abline(h=0.5*log(2))
+}
+meta$i <- meta$delay
+meta$delay <- as.factor(meta$delay)
+levels(meta$delay) <- c("interval=1d","interval=2d","interval=3d",
+                        "interval=4d","interval=5d","interval=6d","interval=7d",
+                        "interval=8d","interval=9d")
+gg10 <- ggplot(data=meta) + geom_line(aes(x=as.Date(time), y=lambda)) + ylim(0,0.75) +
+  geom_hline(yintercept =  c(log(2),0.5*log(2))) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%m-%y") +
+  ylab(expression(lambda(t))) +
+  xlab("time") +
+  geom_text(x=(de$date[250]), y=log(2)+0.03, label="doubling time = 1d") +
+  geom_text(x=(de$date[250]), y=0.5*log(2)+0.03, label="doubling time = 2d") +
+  facet_wrap(~delay) + theme_bw() + ggtitle("A)")
+gg10 <- gg10 + theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+gg11 <- ggplot(data=meta) + geom_line(aes(x=as.Date(time), y=1+lambda*i)) + ylim(1,4) +
+  geom_hline(yintercept =  1) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%m-%y") +
+  ylab("R(t)") +
+  xlab("time") +
+  facet_wrap(~delay) + theme_bw()
+gg11 <- gg11 + theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+inset <- ggplot(data=meta) + geom_line(aes(x=as.Date(time), y=1+lambda*5)) + ylim(1,1.2) +
+  geom_hline(yintercept =  1) +
+  facet_wrap(~delay) + theme_bw()
+#ggdraw() + draw_plot(gg11) + draw_plot(inset, x = 0.07, y = .7, width = .3, height = .3)
+get_inset <- function(df){
+  p <- ggplot(df) + geom_line(aes(x=as.Date(time), y=1+lambda*5)) + 
+  ylim(1, 1.2) + ylab("") + xlab("") +
+  geom_hline(yintercept =  1) +
+  theme_bw(base_size=8) +
+  theme(panel.background = element_rect(fill="white"),  ## white plot background 
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(size=rel(0.8)), ## tiny axis text
+          axis.text.y = element_text(size=rel(0.8)), ## tiny axis text
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          plot.background = element_blank())
+return(p)
+}
+annotation_custom2 <- function (grob, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, data) 
+{
+  layer(data = data, stat = StatIdentity, position = PositionIdentity, 
+        geom = ggplot2:::GeomCustomAnn,
+        inherit.aes = TRUE, params = list(grob = grob, 
+                                          xmin = xmin, xmax = xmax, 
+                                          ymin = ymin, ymax = ymax))
+}
+insets <- meta[meta$time>"2020-05-01 UTC",] %>% 
+  split(f = .$delay) %>%
+  purrr::map(~annotation_custom2(grob = ggplotGrob(get_inset(.)),
+          data = data.frame(delay=unique(.$delay)),
+          ymin = 2.2, ymax=4.1, xmin=as.Date(de$date[60]), xmax=as.Date(de$date[365]))
+  )
+gg11 <- gg11 + ggtitle("B)") + insets
+
+if(jhu)cairo_pdf("Fig07.pdf", width = 14, height = 8)
+ggdraw(plot_grid(gg10,gg11,ncol=2, rel_widths = c(1,1)))
+dev.off()
+
+1+7*log(2)/2
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+
+#########################     Growth Function   ##########################################
+par(mfrow=c(3,1))
+par(mar=c(5.1, 5.5, 4.1, 2.1))
+len<-length(corona.de$confirmed)
+plot(corona.de$cumCases[2:50], 
+     corona.de$cumCases[2:50]-corona.de$cumCases[1:(50-1)], 
+     type = "o",
+     cex = 0.5,
+     xlim = c(0,2.2e6), 
+     ylim = c(0, max(corona.de$cumCases[2:len]-corona.de$cumCases[1:(len-1)])),
+     pch = 20, col = 1, ylab = "d(cumCases)/dt", xlab = "cumCases", 
+     main = "Growth function for cumulative COVID-19 cases (DE)")
+lines(corona.de$cumCases[50:100], 
+     corona.de$cumCases[50:100]-corona.de$cumCases[49:(100-1)], 
+     type = "o",
+     pch = 20, col = 2, cex=0.5)
+lines(corona.de$cumCases[100:150], 
+     corona.de$cumCases[100:150]-corona.de$cumCases[99:(150-1)], 
+     type = "o", cex = 0.5,
+     pch = 20, col = 3)
+lines(corona.de$cumCases[150:200], 
+     corona.de$cumCases[150:200]-corona.de$cumCases[149:(200-1)], 
+     type = "o", cex = 0.5,
+     pch = 20, col = 4)
+lines(corona.de$cumCases[200:250], 
+     corona.de$cumCases[200:250]-corona.de$cumCases[199:(250-1)], 
+     type = "o", cex = 0.5,
+     pch = 20, col = 5)
+lines(corona.de$cumCases[250:300], 
+     corona.de$cumCases[250:300]-corona.de$cumCases[249:(300-1)], 
+     type = "o", cex = 0.5,
+     pch = 20, col = 6)
+lines(corona.de$cumCases[300:len], 
+     corona.de$cumCases[300:len]-corona.de$cumCases[299:(len-1)], 
+     type = "o", cex = 0.5,
+     pch = 20, col = 7)
+legend("topleft", legend = c("t < 50 days","50 days <= t < 100 days","100 days <= t < 150 days","150 days <= t < 200 days","200 days <= t < 250 days","250 days <= t < 300 days","t >= 300 days"), pch = 20, col = 1:7, cex = 0.8)
+
+# plot(corona.de$confirmed[2:len], 
+#      corona.de$confirmed[2:len]-corona.de$confirmed[1:(len-1)], 
+#      xlim = c(0,max(corona.de$confirmed)), 
+#      ylim = c(0, max(corona.de$confirmed[2:len]-corona.de$confirmed[1:(len-1)])),
+#      pch = 20, col = 1, ylab = "dC/dt", xlab = "C", 
+#      main="Growth function for confirmed COVID-19 cases in Germany\nc = confirmed cases, t_max = 373 days from onset of epidemic")
+# points(corona.de$confirmed[52:100], 
+#      corona.de$confirmed[52:100]-corona.de$confirmed[51:(100-1)], 
+#      pch = 20, col = 2)
+# points(corona.de$confirmed[102:150], 
+#      corona.de$confirmed[102:150]-corona.de$confirmed[101:(150-1)], 
+#      pch = 20, col = 3)
+# points(corona.de$confirmed[152:200], 
+#      corona.de$confirmed[152:200]-corona.de$confirmed[151:(200-1)], 
+#      pch = 20, col = 4)
+# points(corona.de$confirmed[202:250], 
+#      corona.de$confirmed[202:250]-corona.de$confirmed[201:(250-1)], 
+#      pch = 20, col = 5)
+# points(corona.de$confirmed[252:300], 
+#      corona.de$confirmed[252:300]-corona.de$confirmed[251:(300-1)], 
+#      pch = 20, col = 6)
+# points(corona.de$confirmed[302:len], 
+#      corona.de$confirmed[302:len]-corona.de$confirmed[301:(len-1)], 
+#      pch = 20, col = 7)
+# legend("topleft", legend = c("t < 50 days","50 days <= t < 100 days","100 days <= t < 150 days","150 days <= t < 200 days","200 days <= t < 250 days","250 days <= t < 300 days","t >= 300 days"), pch = 20, col = 1:7)
+
+#########################     Per Capita Growth Function   ####################################
+
+cairo_pdf("Fig08.pdf", width = 8, height = 10)
+{
+par(mfrow=c(2,1))
+par(mar=c(5.1, 5.5, 2.1, 2.1))
+plot((corona.de$cumCases[2:len]-corona.de$cumCases[1:(len-1)])/corona.de$cumCases[1:(len-1)], 
+     type = "l",
+#     xlim = c(0,2.2e6), 
+     ylim = c(0, 1),
+     pch = 20, col = 1, ylab = TeX('$\\frac{1}{cumCases} \\cdot \\frac{d(cumCases)}{dt}$'), 
+     xlab = "t [days from onset of epidemic]", 
+     main="", xaxt="n")
+title(main = "A)", line = 1, adj = 0) #Per capita growth for cumulative COVID-19 cases (DE)
+axis(1, at = c(seq(0,350,50)), labels = c(seq(0,350,50)), las = 1)
+axis(1, at = c(len), labels = bquote(t[max]==.(len)), las = 2)
+
+
+# plot((corona.de$cumCases[2:len]-corona.de$cumCases[1:(len-1)])/corona.de$cumCases[1:(len-1)], 
+#      type = "l",
+#      xlim = c(220,len), 
+#      ylim = c(0, .1),
+#      pch = 20, col = 1, ylab = TeX("$\\frac{1}{C}\\cdot\\frac{dC}{dt}$"), 
+#      xlab = "t [days from onset of epidemic]", 
+#      main="Per capita growth for cumulative\nCOVID-19 cases, C, in Germany")
+add.scatter(
+  plot((corona.de$cumCases[2:len]-corona.de$cumCases[1:(len-1)])/corona.de$cumCases[1:(len-1)], 
+     type = "l",
+     xlim = c(220,len), 
+     ylim = c(0, .06),
+     pch = 20, col = 1,
+     ylab = "",
+     xlab = "",
+     las = 1
+#     , ylab = TeX("$\\frac{1}{C}\\cdot\\frac{dC}{dt}$"), 
+#     xlab = "t [days from onset of epidemic]", 
+#     main="Per capita growth for cumulative\nCOVID-19 cases, C, in Germany"
+      ),
+  posi="topright", bg.col=rgb(0,0,0,0.1), ratio=.4)
+
+  par(mar=c(5.1, 5.5, 2.1, 2.1))
+  delay=1
+  timeseries <- (corona.de$confirmed[(delay+1):len]-corona.de$confirmed[delay:(len-1)])/
+         corona.de$confirmed[1:(len-delay)]
+  plot(timeseries, 
+       type = "l",
+  #     xlim = c(0,2.2e6), 
+  #     ylim = c(-1, 10),
+       pch = 20, col = 1, ylab = TeX('$\\frac{1}{cases} \\cdot \\frac{d(cases)}{dt}$'), 
+       xlab = "t [days from onset of epidemic]", 
+       main="", xaxt="n")
+  title(main = "B)", line = 1, adj = 0) # Per capita growth for confirmed COVID-19 cases (DE)
+  axis(1, at = c(seq(0,350,50)), labels = c(seq(0,350,50)), las = 1)
+  axis(1, at = c(len), labels = bquote(t[max]==.(len)), las = 2)
+  abline(h=0)
+  fil <- rep(1/7,7)
+  lines(stats::filter(timeseries, fil, sides=2),col="red")
+
+par(mar=c(5.1, 5.5, 2.1, 5.1))
+add.scatter(
+  plot(timeseries, 
+     type = "l",
+     lwd = 0.5,
+     ylim = c(-1, 1),
+     ylab = "",
+     xlab = "",
+     las = 1,
+     col = rgb(0,0,0,0.5)
+      ),
+  posi="topright", bg.col=rgb(0,0,0,0.1), ratio=.33)
+  abline(h=0)
+  fil <- rep(1/7,7)
+  lines(stats::filter(timeseries, fil, sides=2), col="red", lwd=0.7)
+}
+dev.off()
+
+cairo_pdf("Fig09.pdf", width = 8, height = 12)
+{
+  par(mfrow=c(3,1))
+  timeseries<-corona.de$confirmed[1:len]
+  timeseries<-timeseries-mean(timeseries)
+  timeseries.spect <- spectrum(timeseries, log="dB", spans = c(5,7), plot = F, main="Periodogram")
+  #abline(v=1/7)
+  delta <- 1/7
+  spx <- timeseries.spect$freq/delta
+  spy <- 2*timeseries.spect$spec
+  plot(spy~spx, xlab="frequency [1/week]", ylab="spectral density", type="l",
+       main = "",
+       ylim = c(0,5e8))
+  title(main = "A)", line = 2.5, adj = 0) # Spectral density of confirmed cases time series
+
+  timeseries<-corona.de$death[1:len]
+  timeseries<-timeseries-mean(timeseries)
+  timeseries.spect <- spectrum(timeseries, log="dB", spans = c(5,7), plot = F, main="Periodogram")
+  #abline(v=1/7)
+  delta <- 1/7
+  spx <- timeseries.spect$freq/delta
+  spy <- 2*timeseries.spect$spec
+  plot(spy~spx, xlab="frequency [1/week]", ylab="spectral density", type="l",
+       main = "",
+       ylim = c(0,3e5))
+  title(main = "B)", line = 2.5, adj = 0) # Spectral density of confirmed deaths time series
+
+  timeseries.spect <- spec.pgram(ts.union(as.ts(corona.de$confirmed),as.ts(corona.de$death)),
+             spans = c(5,7), kernel, taper = 0.1,
+             pad = 0, fast = TRUE, demean = TRUE, detrend = TRUE,
+             plot = F, na.action = na.fail)
+  
+  #plot(timeseries.spect, plot.type = "marginal") # the default type
+  plot(timeseries.spect, plot.type = "coherency", xlab ="frequency [1/day]", main="")
+  abline(v = 1/7)
+  abline(v = 2/7)
+  abline(v = 0.5/7)
+  axis(3, at = c(0.5/7,1/7,2/7), labels = c("0.5/week","1/week","2/week"), las = 1)
+  title(main = "C)", line = 2.5, adj = 0) # Cases-deaths coherency
+#  plot(timeseries.spect, plot.type = "phase")
+}
+dev.off()
+
+
+#########################     Growth Function cases  ##########################################
+
+# plot(corona.de$confirmed[2:len],
+#      corona.de$confirmed[2:len]-corona.de$confirmed[1:(len-1)],
+#      xlim = c(0,max(corona.de$confirmed)),
+#      ylim = c(0, max(corona.de$confirmed[2:len]-corona.de$confirmed[1:(len-1)])),
+#      pch = 20, col = 1, ylab = "dC/dt", xlab = "C",
+#      main="Growth function for confirmed COVID-19 cases in Germany\nc = confirmed cases, t_max = 373 days from onset of epidemic")
+# points(corona.de$confirmed[52:100],
+#      corona.de$confirmed[52:100]-corona.de$confirmed[51:(100-1)],
+#      pch = 20, col = 2)
+# points(corona.de$confirmed[102:150],
+#      corona.de$confirmed[102:150]-corona.de$confirmed[101:(150-1)],
+#      pch = 20, col = 3)
+# points(corona.de$confirmed[152:200],
+#      corona.de$confirmed[152:200]-corona.de$confirmed[151:(200-1)],
+#      pch = 20, col = 4)
+# points(corona.de$confirmed[202:250],
+#      corona.de$confirmed[202:250]-corona.de$confirmed[201:(250-1)],
+#      pch = 20, col = 5)
+# points(corona.de$confirmed[252:300],
+#      corona.de$confirmed[252:300]-corona.de$confirmed[251:(300-1)],
+#      pch = 20, col = 6)
+# points(corona.de$confirmed[302:len],
+#      corona.de$confirmed[302:len]-corona.de$confirmed[301:(len-1)],
+#      pch = 20, col = 7)
+# legend("topleft", legend = c("t < 50 days","50 days <= t < 100 days","100 days <= t < 150 days","150 days <= t < 200 days","200 days <= t < 250 days","250 days <= t < 300 days","t >= 300 days"), pch = 20, col = 1:7)
+
+#########################     Per Capita Growth Function   ####################################
+{
+  par(mfrow=c(2,2))
+  par(mar=c(5.1, 5.5, 4.1, 2.1))
+  delay=1
+  plot((corona.de$confirmed[(delay+1):len]-corona.de$confirmed[delay:(len-1)])/
+         corona.de$confirmed[1:(len-delay)], 
+       type = "l",
+  #     xlim = c(0,2.2e6), 
+  #     ylim = c(-1, 10),
+       pch = 20, col = 1, ylab = TeX('$\\frac{1}{cases} \\cdot \\frac{d(cases)}{dt}$'), 
+       xlab = "t [days from onset of epidemic]", 
+       main="Per capita growth for confirmed COVID-19 cases (DE)")
+  abline(h=0)
+  # par(mfrow=c(2,1))
+  # par(mar=c(5.1, 5.5, 4.1, 2.1))
+  # plot((corona.de$death[2:len]-corona.de$death[1:(len-1)]), 
+  #      type = "l",
+  # #     xlim = c(0,2.2e6), 
+  # #     ylim = c(0, 10),
+  #      pch = 20, col = 1, ylab = TeX('$\\frac{1}{C} \\cdot \\frac{dC}{dt}$'), 
+  #      xlab = "t [days from onset of epidemic]", 
+  #      main="Per capita growth for confirmed COVID-19 cases (DE)")
+  # abline(h=0)
+  
+  ##### Periodogram per capita growth cumCases    ########
+  
+  if(F){
+    par(mar=c(5.1, 4.1, 4.1, 2.1))
+    par(mfrow=c(2,1))
+    timeseries<-(corona.de$cumCases[7:len]-corona.de$cumCases[6:(len-1)])/corona.de$cumCases[6:(len-1)]
+    timeseries<-timeseries-mean(timeseries)
+    #periodogram(timeseries, log="no", plot=TRUE, ylab="Periodogram", xlab="Frequency", lwd=1)
+    #abline(v=1/7)
+    timeseries.spect <- spectrum(timeseries, log="no", span = 2, plot = T, main="Periodogram")
+    abline(v=1/7)
+    delta <- 1/7
+    spx <- timeseries.spect$freq/delta
+    spy <- 2*timeseries.spect$spec
+    plot(spy~spx, xlab="frequency [1/week]", ylab="spectral density", type="l")
+  }
+  ##### Periodogram per capita growth cases ########
+  
+  timeseries<-(corona.de$confirmed[36:len]-corona.de$confirmed[35:(len-1)])/corona.de$confirmed[35:(len-1)]
+  timeseries<-timeseries-mean(timeseries)
+  timeseries.spect <- spectrum(timeseries, log="no", span = 2, plot = F, main="Periodogram")
+  timeseries.spect <- spec.pgram(ts.union(as.ts(corona.de$confirmed),as.ts(corona.de$death)), 
+             spans = c(5,7), kernel, taper = 0.1,
+             pad = 0, fast = TRUE, demean = FALSE, detrend = TRUE,
+             plot = T, na.action = na.fail)
+  
+  
+  #plot(timeseries.spect, plot.type = "marginal") # the default type
+  plot(timeseries.spect, plot.type = "coherency")
+  plot(timeseries.spect, plot.type = "phase")
+}
+
+
+if(F){
+  timeseries<-(corona.de$confirmed[221:len]-corona.de$confirmed[220:(len-1)])/corona.de$confirmed[220:(len-1)]
+  plot(timeseries, type="l")
+  timeseries<-(corona.de$confirmed[61:len]-corona.de$confirmed[60:(len-1)])/corona.de$confirmed[60:(len-1)]
+  timeseries<-timeseries-mean(timeseries)
+  timeseries.spect <- spectrum(timeseries, log="no", span = 2, plot = T, main="Periodogram")
+  abline(v=1/7)
+  delta <- 1/7
+  spx <- timeseries.spect$freq/delta
+  spy <- 2*timeseries.spect$spec
+  plot(spy~spx, xlab="frequency [1/week]", ylab="spectral density", type="l")
+  
+  timeseries<-corona.de$confirmed[220:len]
+  timeseries<-timeseries-mean(timeseries)
+  timeseries.spect <- spectrum(timeseries, log="no", span = 2, plot = T, main="Periodogram")
+  abline(v=1/7)
+  delta <- 1/7
+  spx <- timeseries.spect$freq/delta
+  spy <- 2*timeseries.spect$spec
+  plot(spy~spx, xlab="frequency [1/week]", ylab="spectral density", type="l")
+}
+```
+
